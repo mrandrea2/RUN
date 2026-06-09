@@ -32,74 +32,128 @@ DATI REALI DA APPLE SALUTE (ultime ${summary.weeks} settimane)
 - Corse totali: ${summary.totalRuns}
 - Media corse/settimana: ${summary.runsPerWeek}
 - Km totali: ${summary.totalKm}
-- Corsa più lunga: ${summary.longestKm} km
+- Corsa piu lunga: ${summary.longestKm} km
 - Passo medio: ${summary.avgPace ? formatPace(summary.avgPace) + " /km" : "n/d"}`;
   }
   return ctx;
+}
+
+/* =========================================================
+   PARSING JSON ROBUSTO
+   Gestisce: fence markdown, testo extra, virgole finali,
+   e — soprattutto — JSON TRONCATO (chiude le strutture aperte).
+   ========================================================= */
+function extractJsonBlock(text) {
+  let t = (text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
+  const start = t.indexOf("{");
+  if (start === -1) return t;
+  const end = t.lastIndexOf("}");
+  return end > start ? t.slice(start, end + 1) : t.slice(start);
+}
+
+// Ripara un JSON troncato chiudendo stringhe/array/oggetti rimasti aperti.
+function repairTruncatedJson(s) {
+  const stack = [];
+  let inStr = false;
+  let escaped = false;
+  let result = "";
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    result += ch;
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === "{" || ch === "[") stack.push(ch);
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+
+  if (inStr) result += '"';
+  result = result.replace(/,\s*$/, "");
+  result = result.replace(/,\s*"[^"]*"\s*:\s*("[^"]*)?$/, "");
+
+  for (let i = stack.length - 1; i >= 0; i--) {
+    result += stack[i] === "{" ? "}" : "]";
+  }
+  return result;
+}
+
+function safeParsePlan(text) {
+  const block = extractJsonBlock(text);
+
+  try { return JSON.parse(block); } catch (_) {}
+  try { return JSON.parse(block.replace(/,(\s*[}\]])/g, "$1")); } catch (_) {}
+  try {
+    const repaired = repairTruncatedJson(block).replace(/,(\s*[}\]])/g, "$1");
+    return JSON.parse(repaired);
+  } catch (e) {
+    throw new Error("piano non interpretabile");
+  }
 }
 
 // === GENERAZIONE DEL PIANO (JSON strutturato) ===
 export async function generatePlan(profile, summary) {
   const context = buildContext(profile, summary);
 
-  const system = `Sei un coach di corsa esperto, scienziato dello sport, che parla italiano.
-Crei programmi di allenamento di corsa periodizzati, sicuri e progressivi, basati su evidenze.
-Adatti il carico al livello reale dell'atleta e ai dati disponibili.
-Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo prima o dopo, senza backtick markdown.
+  const system = `Sei un coach di corsa esperto, scienziato dello sport, che parli italiano.
+Crei programmi di corsa periodizzati, sicuri e progressivi, basati su evidenze, adattati al livello reale dell'atleta.
 
-Schema JSON richiesto:
+Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo prima o dopo, senza backtick markdown, senza a capo dentro i valori stringa.
+
+Schema:
 {
-  "titolo": "string",
+  "titolo": "string breve",
   "durataSettimane": number,
   "obiettivo": "string",
-  "introduzione": "string (2-3 frasi motivanti e chiare)",
+  "introduzione": "string, max 2 frasi",
   "principi": ["string", "string", "string"],
   "settimane": [
     {
       "numero": number,
-      "focus": "string breve",
+      "focus": "string brevissima",
       "kmTotali": number,
       "sessioni": [
         {
           "giorno": "Lun|Mar|Mer|Gio|Ven|Sab|Dom",
           "tipo": "Riposo|Facile|Lungo|Ripetute|Tempo|Fartlek|Recupero|Cross-training",
-          "titolo": "string breve",
-          "distanzaKm": number (0 se riposo),
+          "titolo": "string brevissima",
+          "distanzaKm": number,
           "durataMin": number,
-          "passoTarget": "string es. 6:00/km o 'libero'",
-          "descrizione": "string chiara su cosa fare",
-          "note": "string consigli (riscaldamento, respiro, ecc.)"
+          "passoTarget": "string es. 6:00/km",
+          "descrizione": "string max 15 parole",
+          "note": "string max 12 parole"
         }
       ]
     }
   ]
 }
 
-Regole:
-- Numero di sessioni di corsa a settimana = giorni desiderati dall'atleta; le altre giornate sono Riposo o Cross-training.
-- Progressione realistica del volume (max +10% a settimana), con una settimana di scarico ogni 3-4.
-- Se i dati Apple Salute mostrano un livello diverso da quello dichiarato, fidati dei dati reali e spiegalo nell'introduzione.
-- Passi target coerenti con il passo medio reale dell'atleta.
-- Genera tutte le settimane fino al raggiungimento dell'obiettivo (di norma 6-12 settimane).`;
+REGOLE FERREE PER NON ECCEDERE LA LUNGHEZZA:
+- Massimo 8 settimane totali (se l'obiettivo e lontano, copri le 8 settimane piu utili).
+- "descrizione" max 15 parole, "note" max 12 parole, niente a capo dentro le stringhe.
+- Sessioni di corsa a settimana = giorni desiderati; gli altri giorni Riposo o Cross-training (per il riposo metti distanzaKm 0 e durataMin 0).
+- Progressione realistica (+10% max a settimana), una settimana di scarico ogni 3-4.
+- Se i dati Apple Salute indicano un livello diverso da quello dichiarato, fidati dei dati reali.`;
 
-  const userMsg = `Crea il piano per questo atleta:
+  const userMsg = `Crea il piano per questo atleta. Rispetta i limiti di lunghezza. Restituisci SOLO il JSON.
 
-${context}
-
-Restituisci solo il JSON.`;
+${context}`;
 
   const text = await callCoach({
     system,
     messages: [{ role: "user", content: userMsg }],
     max_tokens: 8000,
-    temperature: 0.6,
+    temperature: 0.5,
   });
 
-  const clean = text.replace(/```json/gi, "").replace(/```/g, "").trim();
-  const start = clean.indexOf("{");
-  const end = clean.lastIndexOf("}");
-  const json = clean.slice(start, end + 1);
-  return JSON.parse(json);
+  const plan = safeParsePlan(text);
+
+  if (!plan || !Array.isArray(plan.settimane) || plan.settimane.length === 0) {
+    throw new Error("piano vuoto");
+  }
+  plan.durataSettimane = plan.settimane.length;
+  return plan;
 }
 
 // === CHAT MOTIVAZIONALE ===
@@ -112,7 +166,7 @@ export async function coachReply(profile, summary, history, userMessage, plan) {
   const system = `Sei "Coach", l'allenatore di corsa personale dell'atleta. Parli italiano.
 Sei caldo, diretto, energico e motivante — come un grande coach che crede davvero nei suoi atleti, senza essere sdolcinato.
 Dai consigli pratici e concreti sulla corsa (tecnica, ritmo, recupero, alimentazione di base, gestione della fatica e della testa).
-Rispondi in modo conciso (2-6 frasi), con un tono che dà carica. Usa il "tu". Non inventare dati medici: per dolori o infortuni consiglia un professionista.
+Rispondi in modo conciso (2-6 frasi), con un tono che da carica. Usa il "tu". Non inventare dati medici: per dolori o infortuni consiglia un professionista.
 
 CONTESTO ATLETA:
 ${context}${planNote}`;
@@ -130,14 +184,11 @@ export async function dailyBoost(profile, nextSession) {
   const system = `Sei un coach di corsa motivazionale italiano. Genera UNA sola frase breve (max 18 parole), potente e originale, che dia carica all'atleta per il suo allenamento di oggi. Niente virgolette, niente emoji eccessive (max 1). Tono energico ma autentico.`;
   const sess = nextSession
     ? `Oggi: ${nextSession.tipo} — ${nextSession.titolo} (${nextSession.distanzaKm} km).`
-    : `Oggi è un giorno di corsa.`;
+    : `Oggi e un giorno di corsa.`;
   return callCoach({
     system,
     messages: [
-      {
-        role: "user",
-        content: `Obiettivo dell'atleta: ${profile.goal}. ${sess} Dammi la frase.`,
-      },
+      { role: "user", content: `Obiettivo dell'atleta: ${profile.goal}. ${sess} Dammi la frase.` },
     ],
     max_tokens: 80,
     temperature: 1,
