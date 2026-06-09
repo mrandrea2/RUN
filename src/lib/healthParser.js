@@ -122,40 +122,71 @@ export function parseWorkoutsFromXml(xml) {
 }
 
 // Punto d'ingresso: accetta File (.zip o .xml)
+// I nomi nell'export di Apple Salute sono LOCALIZZATI:
+//   EN -> apple_health_export/export.xml
+//   IT -> esportazione/esportazione.xml
+// Quindi non cerchiamo un nome fisso: prendiamo qualsiasi .xml utile.
 export async function parseHealthExport(file, onProgress) {
   const name = (file.name || "").toLowerCase();
-
-  let xmlText = "";
 
   if (name.endsWith(".zip")) {
     onProgress?.("Apertura dell'archivio…");
     const zip = await JSZip.loadAsync(file);
-    // Cerca export.xml (a volte è dentro apple_health_export/)
-    let entry =
-      zip.file("apple_health_export/export.xml") ||
-      zip.file("export.xml");
-    if (!entry) {
-      // fallback: primo .xml grande trovato
-      const xmls = zip.file(/export\.xml$/);
-      entry = xmls && xmls.length ? xmls[0] : null;
-    }
-    if (!entry) {
+
+    // raccogli tutti gli XML presenti nell'archivio
+    const candidates = [];
+    zip.forEach((path, entry) => {
+      if (!entry.dir && /\.xml$/i.test(path)) candidates.push({ path, entry });
+    });
+
+    if (candidates.length === 0) {
       throw new Error(
-        "Non ho trovato export.xml dentro lo zip. Assicurati di caricare il file esportato da Salute."
+        "Nessun file XML nello zip. Carica l'archivio export.zip ottenuto da Salute (non altri file o cartelle)."
       );
     }
+
+    // preferisci i file NON clinici (il *_cda.xml non contiene gli allenamenti);
+    // poi, a parità, il file più grande (di solito è l'export principale)
+    candidates.forEach((c) => {
+      c.cda = /cda/i.test(c.path);
+      c.size = (c.entry._data && c.entry._data.uncompressedSize) || 0;
+    });
+    candidates.sort((a, b) => a.cda - b.cda || b.size - a.size);
+
     onProgress?.("Lettura dei dati… (può richiedere qualche secondo)");
-    xmlText = await entry.async("string");
-  } else if (name.endsWith(".xml")) {
-    onProgress?.("Lettura del file…");
-    xmlText = await file.text();
-  } else {
-    throw new Error("Formato non riconosciuto. Carica un file .zip o .xml.");
+
+    let runs = [];
+    let recognized = false;
+    for (const c of candidates) {
+      const txt = await c.entry.async("string");
+      if (/<HealthData/i.test(txt)) recognized = true;
+      if (!/<Workout/i.test(txt)) continue;
+      onProgress?.("Estrazione delle corse…");
+      const r = parseWorkoutsFromXml(txt);
+      if (r.length) {
+        runs = r;
+        break;
+      }
+    }
+
+    if (runs.length === 0 && !recognized) {
+      throw new Error(
+        "Non ho riconosciuto i dati di Salute nello zip. Assicurati di scegliere 'Esporta tutti i dati sanitari' e di caricare il file così com'è."
+      );
+    }
+    return runs; // [] se l'export è valido ma non ci sono corse registrate
   }
 
-  onProgress?.("Estrazione delle corse…");
-  const runs = parseWorkoutsFromXml(xmlText);
-  return runs;
+  if (name.endsWith(".xml")) {
+    onProgress?.("Lettura del file…");
+    const txt = await file.text();
+    onProgress?.("Estrazione delle corse…");
+    return parseWorkoutsFromXml(txt);
+  }
+
+  throw new Error(
+    "Formato non riconosciuto. Carica il file .zip (o .xml) esportato da Salute."
+  );
 }
 
 // Statistiche di sintesi sulle ultime N settimane
