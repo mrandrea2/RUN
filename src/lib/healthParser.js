@@ -1,14 +1,14 @@
 // src/lib/healthParser.js
 // Estrae le sessioni di CORSA dal file esportato da Apple Salute.
-// Apple esporta un export.zip che contiene export.xml (spesso molto grande).
-// Per non far esplodere il browser non usiamo DOMParser sull'intero file:
-// estraiamo solo i blocchi <Workout ...> di tipo Running con una scansione mirata.
+// Lo zip di Apple usa i "data descriptor": per leggerlo in modo affidabile
+// usiamo fflate (JSZip falliva con "uncompressed data size mismatch").
+// I nomi nell'export sono LOCALIZZATI (es. IT: esportazione/esportazione.xml),
+// quindi non cerchiamo un nome fisso ma qualsiasi .xml utile.
 
-import JSZip from "jszip";
+import { unzip } from "fflate";
 
 const RUN_TYPE = "HKWorkoutActivityTypeRunning";
 
-// Converte le distanze in km
 function toKm(value, unit) {
   const v = parseFloat(value);
   if (isNaN(v)) return null;
@@ -16,10 +16,9 @@ function toKm(value, unit) {
   if (u === "km") return v;
   if (u === "mi") return v * 1.609344;
   if (u === "m") return v / 1000;
-  return v; // assume km
+  return v;
 }
 
-// Converte la durata in minuti
 function toMinutes(value, unit) {
   const v = parseFloat(value);
   if (isNaN(v)) return null;
@@ -35,15 +34,13 @@ function getAttr(tag, name) {
   return m ? m[1] : null;
 }
 
-// Estrae la distanza dalle WorkoutStatistics figlie (formato iOS recente)
 function distanceFromStats(block) {
   const re =
     /<WorkoutStatistics[^>]*type="HKQuantityTypeIdentifierDistanceWalkingRunning"[^>]*>/g;
   let match;
   while ((match = re.exec(block)) !== null) {
-    const stat = match[0];
-    const sum = getAttr(stat, "sum");
-    const unit = getAttr(stat, "unit");
+    const sum = getAttr(match[0], "sum");
+    const unit = getAttr(match[0], "unit");
     if (sum) return toKm(sum, unit);
   }
   return null;
@@ -71,10 +68,8 @@ function hrFromStats(block) {
   return null;
 }
 
-// Parsa la stringa XML estraendo solo le corse
 export function parseWorkoutsFromXml(xml) {
   const runs = [];
-  // Cattura sia <Workout .../> che <Workout ...>...</Workout>
   const workoutRe = /<Workout\b[^>]*?(?:\/>|>[\s\S]*?<\/Workout>)/g;
   let m;
   while ((m = workoutRe.exec(xml)) !== null) {
@@ -82,83 +77,96 @@ export function parseWorkoutsFromXml(xml) {
     if (!block.includes(RUN_TYPE)) continue;
 
     const header = block.slice(0, block.indexOf(">") + 1);
-
     const startDate = getAttr(header, "startDate");
     const duration = getAttr(header, "duration");
     const durationUnit = getAttr(header, "durationUnit");
 
-    // distanza: prima prova l'attributo legacy, poi le statistiche figlie
     let km = null;
     const totalDistance = getAttr(header, "totalDistance");
-    if (totalDistance) {
-      km = toKm(totalDistance, getAttr(header, "totalDistanceUnit"));
-    } else {
-      km = distanceFromStats(block);
-    }
+    if (totalDistance) km = toKm(totalDistance, getAttr(header, "totalDistanceUnit"));
+    else km = distanceFromStats(block);
 
     const minutes = toMinutes(duration, durationUnit);
-
     if (!startDate || !minutes) continue;
 
-    const date = new Date(startDate.replace(" +", "+").replace(/ /, "T"));
+    const date = new Date(startDate.replace(/ ([+-]\d)/, "$1").replace(/ /, "T"));
     const dist = km && km > 0 ? km : null;
-    const paceMinPerKm =
-      dist && minutes ? minutes / dist : null;
+    const paceMinPerKm = dist && minutes ? minutes / dist : null;
 
     runs.push({
       id: `${startDate}-${(dist || 0).toFixed(2)}`,
       date: isNaN(date.getTime()) ? new Date(startDate) : date,
       distanceKm: dist,
       durationMin: minutes,
-      pace: paceMinPerKm, // min/km in decimale
+      pace: paceMinPerKm,
       calories: energyFromStats(block),
       avgHr: hrFromStats(block),
     });
   }
-
-  // ordina dal più recente
   runs.sort((a, b) => b.date - a.date);
   return runs;
 }
 
-// Punto d'ingresso: accetta File (.zip o .xml)
-// I nomi nell'export di Apple Salute sono LOCALIZZATI:
-//   EN -> apple_health_export/export.xml
-//   IT -> esportazione/esportazione.xml
-// Quindi non cerchiamo un nome fisso: prendiamo qualsiasi .xml utile.
+// Legge il file come ArrayBuffer (con fallback per Safari più vecchi)
+function readArrayBuffer(file) {
+  if (file.arrayBuffer) return file.arrayBuffer();
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error("Lettura del file non riuscita"));
+    r.readAsArrayBuffer(file);
+  });
+}
+
+// Decomprime con fflate solo i file .xml dell'archivio
+function unzipXmlFiles(uint8) {
+  return new Promise((resolve, reject) => {
+    unzip(
+      uint8,
+      { filter: (f) => /\.xml$/i.test(f.name) },
+      (err, data) => (err ? reject(err) : resolve(data))
+    );
+  });
+}
+
 export async function parseHealthExport(file, onProgress) {
   const name = (file.name || "").toLowerCase();
 
   if (name.endsWith(".zip")) {
     onProgress?.("Apertura dell'archivio…");
-    const zip = await JSZip.loadAsync(file);
+    const buf = new Uint8Array(await readArrayBuffer(file));
 
-    // raccogli tutti gli XML presenti nell'archivio
-    const candidates = [];
-    zip.forEach((path, entry) => {
-      if (!entry.dir && /\.xml$/i.test(path)) candidates.push({ path, entry });
-    });
-
-    if (candidates.length === 0) {
+    let files;
+    try {
+      files = await unzipXmlFiles(buf);
+    } catch (e) {
       throw new Error(
-        "Nessun file XML nello zip. Carica l'archivio export.zip ottenuto da Salute (non altri file o cartelle)."
+        "Non riesco ad aprire questo archivio. Assicurati di caricare il file export.zip così com'è (senza rinominarlo o ricomprimerlo)."
       );
     }
 
-    // preferisci i file NON clinici (il *_cda.xml non contiene gli allenamenti);
-    // poi, a parità, il file più grande (di solito è l'export principale)
-    candidates.forEach((c) => {
-      c.cda = /cda/i.test(c.path);
-      c.size = (c.entry._data && c.entry._data.uncompressedSize) || 0;
+    const names = Object.keys(files);
+    if (names.length === 0) {
+      throw new Error(
+        "Nessun file XML nello zip. Carica l'archivio export.zip ottenuto da Salute (non altri file)."
+      );
+    }
+
+    // preferisci i file NON clinici (*_cda.xml non ha gli allenamenti); poi il più grande
+    names.sort((a, b) => {
+      const ac = /cda/i.test(a) ? 1 : 0;
+      const bc = /cda/i.test(b) ? 1 : 0;
+      if (ac !== bc) return ac - bc;
+      return files[b].length - files[a].length;
     });
-    candidates.sort((a, b) => a.cda - b.cda || b.size - a.size);
 
     onProgress?.("Lettura dei dati… (può richiedere qualche secondo)");
+    const decoder = new TextDecoder("utf-8");
 
     let runs = [];
     let recognized = false;
-    for (const c of candidates) {
-      const txt = await c.entry.async("string");
+    for (const n of names) {
+      const txt = decoder.decode(files[n]);
       if (/<HealthData/i.test(txt)) recognized = true;
       if (!/<Workout/i.test(txt)) continue;
       onProgress?.("Estrazione delle corse…");
@@ -171,10 +179,10 @@ export async function parseHealthExport(file, onProgress) {
 
     if (runs.length === 0 && !recognized) {
       throw new Error(
-        "Non ho riconosciuto i dati di Salute nello zip. Assicurati di scegliere 'Esporta tutti i dati sanitari' e di caricare il file così com'è."
+        "Non ho riconosciuto i dati di Salute nello zip. Scegli 'Esporta tutti i dati sanitari' e carica il file così com'è."
       );
     }
-    return runs; // [] se l'export è valido ma non ci sono corse registrate
+    return runs;
   }
 
   if (name.endsWith(".xml")) {
@@ -189,7 +197,6 @@ export async function parseHealthExport(file, onProgress) {
   );
 }
 
-// Statistiche di sintesi sulle ultime N settimane
 export function summarizeRuns(runs, weeks = 4) {
   if (!runs || runs.length === 0) return null;
   const cutoff = new Date();
@@ -201,13 +208,8 @@ export function summarizeRuns(runs, weeks = 4) {
   const withDist = pool.filter((r) => r.distanceKm);
   const totalKm = withDist.reduce((s, r) => s + r.distanceKm, 0);
   const paces = withDist.filter((r) => r.pace).map((r) => r.pace);
-  const avgPace = paces.length
-    ? paces.reduce((s, p) => s + p, 0) / paces.length
-    : null;
-  const longest = withDist.reduce(
-    (max, r) => (r.distanceKm > max ? r.distanceKm : max),
-    0
-  );
+  const avgPace = paces.length ? paces.reduce((s, p) => s + p, 0) / paces.length : null;
+  const longest = withDist.reduce((max, r) => (r.distanceKm > max ? r.distanceKm : max), 0);
 
   return {
     totalRuns: pool.length,
@@ -219,7 +221,6 @@ export function summarizeRuns(runs, weeks = 4) {
   };
 }
 
-// Formatta un passo decimale (min/km) in "m:ss"
 export function formatPace(pace) {
   if (!pace || !isFinite(pace)) return "—";
   const min = Math.floor(pace);
