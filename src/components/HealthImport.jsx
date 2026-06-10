@@ -1,7 +1,7 @@
 // src/components/HealthImport.jsx
 import React, { useRef, useState } from "react";
 import { IconUpload } from "./Icons";
-import { parseHealthExport, summarizeRuns, formatPace } from "../lib/healthParser";
+import { parseHealthExport, summarizeRuns, formatPace, PARSER_VERSION } from "../lib/healthParser";
 
 export default function HealthImport({ runs, onRuns }) {
   const fileRef = useRef(null);
@@ -101,6 +101,9 @@ export default function HealthImport({ runs, onRuns }) {
           {error}
         </div>
       )}
+      <p className="faint" style={{ fontSize: 11, marginTop: 12, opacity: 0.6 }}>
+        lettore dati {PARSER_VERSION}
+      </p>
     </div>
   );
 }
